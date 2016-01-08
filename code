@@ -1,0 +1,263 @@
+# Authors-Classification-Based-on-Corpus-of-Texts
+Codes for "Authors Classification Based on Corpus of Texts" Project in R.
+
+library(Matrix)
+library(glmnet)
+
+lset <- readRDS("lset.Rds")
+meta <- readRDS("metaData.Rds")
+lemma <- readRDS("mmLemma.Rds")
+
+# Totally balanced dataset.
+
+# Function for ROC and AUC.
+roc <- function(y, pred) {
+  alpha <- quantile(pred, seq(0,1,by=0.01))
+  N <- length(alpha)
+  
+  sens <- rep(NA,N)
+  spec <- rep(NA,N)
+  for (i in 1:N) {
+    predClass <- as.numeric(pred >= alpha[i])
+    sens[i] <- sum(predClass == 1 & y == 1) / sum(y == 1)
+    spec[i] <- sum(predClass == 0 & y == 0) / sum(y == 0)
+  }
+  return(list(fpr=1- spec, tpr=sens))
+}
+auc <- function(r) {
+  sum((r$fpr) * diff(c(0,r$tpr)))
+}
+
+
+# First of all, consider about sex.
+# Only existing missing for two values at the same time.
+
+# Set training:testing = 7:3
+n <- floor(sum(meta$train == 1)*7/10)
+# Flag for training set. Need to get a balanced one.
+set.seed(1)
+train <- which(meta$train == 1 & meta$female == 1)
+trainFlag <- sample(train, n/2, replace = FALSE)
+train <- which(meta$train == 1 & meta$female == 0)
+trainFlag <- c(trainFlag, sample(train, n/2, replace = FALSE))
+# Flag for testing set.
+trainTest <- setdiff(which(meta$train == 1), trainFlag)
+# Flag for missing set.
+trainMiss <- setdiff(1:nrow(meta), which(meta$train == 1))
+
+# Elastic Net: select best alpha.
+alphaall <- seq(0, 1, length.out = 10)
+auc_all <- c()
+lambda_all <- c()
+for (i in 1:length(alphaall)) {
+  alpha <- alphaall[i]
+  outLasso <- glmnet(lemma[trainFlag,], meta$female[trainFlag], family="binomial", alpha = alpha)
+  aucValsLasso <- rep(NA, length(outLasso$lambda))
+  for (j in 1:length(outLasso$lambda)) {
+    pred <- 1 / (1 + exp(-1 * cbind(1,lemma[trainTest,]) %*% coef(outLasso)[,j]))
+    r <- roc(meta$female[trainTest], pred)
+    aucValsLasso[j] <- auc(r)
+  }
+  best <- which.max(aucValsLasso)
+  auc_all <- c(auc_all, aucValsLasso[best])
+  lambda_all <- c(lambda_all, outLasso$lambda[best])
+}
+
+#plot(log(outLasso$lambda)[1:15], aucValsLasso[1:15], type="l",
+#     xlab="log lambda", ylab="AUC", main="lasso",
+#     ylim=range(c(aucValsLasso[-1])))
+
+best_lambda <- lambda_all[which.max(auc_all)]
+best_alpha <- alphaall[which.max(auc_all)]
+
+
+# Select best threshold using 4-folds cross validation.
+# Separate dataset into 4 parts, with 1369 1's and 0's in each part.
+n <- sum(meta$train == 1)
+each <- n/8
+index1 <- which(meta$train == 1 & meta$female == 1)
+index0 <- which(meta$train == 1 & meta$female == 0)
+female1 <- list()
+female0 <- list()
+index1 <- sample(index1, n/2, replace = FALSE)
+for (i in 1:4) {
+  female1[[i]] <- index1[(1+(i-1)*each):(i*each)]
+}
+index0 <- sample(index0, n/2, replace = FALSE)
+for (i in 1:4) {
+  female0[[i]] <- index0[(1+(i-1)*each):(i*each)]
+}
+
+# Using CV to decide on the best accuracy of each threshold.
+thresholds <- seq(0.4, 0.6, length.out = 100)
+acc <- list()
+
+for (i in 1:4) {
+  trainTest_CV <- c(female1[[i]], female0[[i]])
+  trainFlag_CV <- setdiff(c(trainFlag, trainTest), trainTest_CV)
+  outLasso <- glmnet(lemma[trainFlag_CV,], meta$female[trainFlag_CV], family="binomial", 
+                     alpha = best_alpha, lambda = best_lambda)
+  pred <- 1 / (1 + exp(-1 * cbind(1,lemma[trainTest_CV,]) %*% coef(outLasso)))
+  acc[[i]] <- c(NA, 100)
+  for (j in 1:100) {
+    p <- as.numeric(pred >= thresholds[j])
+    acc[[i]][j] <- sum(p == meta$female[trainTest_CV]) / length(p)
+  }
+}
+
+# Calculate average accuracy under different thresholds.
+accuracy <- (acc[[1]] + acc[[2]] + acc[[3]] + acc[[4]])/4
+plot(thresholds, 
+     accuracy,
+     main = "Sex:Accuracy under Different Thresholds",
+     xlab = c("Threshold"), ylab = c("Accuracy"))
+cut <- thresholds[which.max(accuracy)]
+#lines(spec@x.values[[1]], spec@y.values[[1]], col = "red")
+abline(v = cut, lty = c(2))
+#abline(h = spec@y.values[[1]][which(sens@y.values[[1]] == spec@y.values[[1]])], lty = c(2))
+#legend("bottomright", c("sensitivity", "specificity"), col = c("blue", "red"), lty = c(1, 1))
+
+# Actually, if we look at distribution of pred:
+table(as.vector(pred))
+# The best threshold on this testing dataset is 0.4989899
+
+
+# New predictions
+outLasso <- glmnet(lemma[c(trainTest, trainFlag),], 
+                   meta$female[c(trainTest, trainFlag)], 
+                   family="binomial", 
+                   alpha = best_alpha, lambda = best_lambda)
+pred <- 1 / (1 + exp(-1 * cbind(1,lemma[trainMiss,]) %*% coef(outLasso)))
+meta$female[trainMiss] <- as.numeric(pred >= cut)
+#write.table(meta, "female_prediction_LASSO.txt", sep = " ")
+
+# saveRDS(meta, "female_prediction_LASSO.Rds")
+
+# Record params
+#result <- data.frame(alpha = alphaall, lambda = lambda_all, auc = auc_all)
+#write.table(result, "female_LASSO_paras.txt", sep = " ")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Second, consider about age.
+# Only existing missing for two values at the same time.
+
+# Set training:testing = 7:3
+n <- floor(sum(meta$train == 1)*7/10)
+# Flag for training set. Need to get a balanced one.
+set.seed(1)
+train <- which(meta$train == 1 & meta$age == 1)
+trainFlag <- sample(train, n/2, replace = FALSE)
+train <- which(meta$train == 1 & meta$age == 0)
+trainFlag <- c(trainFlag, sample(train, n/2, replace = FALSE))
+# Flag for testing set.
+trainTest <- setdiff(which(meta$train == 1), trainFlag)
+# Flag for missing set.
+trainMiss <- setdiff(1:nrow(meta), which(meta$train == 1))
+
+# Elastic Net: select best alpha.
+alphaall <- seq(0, 1, length.out = 10)
+auc_all <- c()
+lambda_all <- c()
+for (i in 1:length(alphaall)) {
+  alpha <- alphaall[i]
+  outLasso <- glmnet(lemma[trainFlag,], meta$age[trainFlag], family="binomial", alpha = alpha)
+  aucValsLasso <- rep(NA, length(outLasso$lambda))
+  for (j in 1:length(outLasso$lambda)) {
+    pred <- 1 / (1 + exp(-1 * cbind(1,lemma[trainTest,]) %*% coef(outLasso)[,j]))
+    r <- roc(meta$age[trainTest], pred)
+    aucValsLasso[j] <- auc(r)
+  }
+  best <- which.max(aucValsLasso)
+  auc_all <- c(auc_all, aucValsLasso[best])
+  lambda_all <- c(lambda_all, outLasso$lambda[best])
+}
+
+#plot(log(outLasso$lambda)[1:15], aucValsLasso[1:15], type="l",
+#     xlab="log lambda", ylab="AUC", main="lasso",
+#     ylim=range(c(aucValsLasso[-1])))
+
+best_lambda <- lambda_all[which.max(auc_all)]
+best_alpha <- alphaall[which.max(auc_all)]
+
+
+# Select best threshold using 4-folds cross validation.
+# Separate dataset into 4 parts, with 1369 1's and 0's in each part.
+n <- sum(meta$train == 1)
+each <- n/8
+index1 <- which(meta$train == 1 & meta$age == 1)
+index0 <- which(meta$train == 1 & meta$age == 0)
+age1 <- list()
+age0 <- list()
+index1 <- sample(index1, n/2, replace = FALSE)
+for (i in 1:4) {
+  age1[[i]] <- index1[(1+(i-1)*each):(i*each)]
+}
+index0 <- sample(index0, n/2, replace = FALSE)
+for (i in 1:4) {
+  age0[[i]] <- index0[(1+(i-1)*each):(i*each)]
+}
+
+# Using CV to decide on the best accuracy of each threshold.
+thresholds <- seq(0.4, 0.6, length.out = 100)
+acc <- list()
+
+for (i in 1:4) {
+  trainTest_CV <- c(age1[[i]], age0[[i]])
+  trainFlag_CV <- setdiff(c(trainFlag, trainTest), trainTest_CV)
+  outLasso <- glmnet(lemma[trainFlag_CV,], meta$age[trainFlag_CV], family="binomial", 
+                     alpha = best_alpha, lambda = best_lambda)
+  pred <- 1 / (1 + exp(-1 * cbind(1,lemma[trainTest_CV,]) %*% coef(outLasso)))
+  acc[[i]] <- c(NA, 100)
+  for (j in 1:100) {
+    p <- as.numeric(pred >= thresholds[j])
+    acc[[i]][j] <- sum(p == meta$age[trainTest_CV]) / length(p)
+  }
+}
+
+# Calculate average accuracy under different thresholds.
+accuracy <- (acc[[1]] + acc[[2]] + acc[[3]] + acc[[4]])/4
+plot(thresholds, 
+     accuracy,
+     main = "Age:Accuracy under Different Thresholds",
+     xlab = c("Threshold"), ylab = c("Accuracy"))
+cut <- thresholds[which.max(accuracy)]
+#lines(spec@x.values[[1]], spec@y.values[[1]], col = "red")
+abline(v = cut, lty = c(2))
+#abline(h = spec@y.values[[1]][which(sens@y.values[[1]] == spec@y.values[[1]])], lty = c(2))
+#legend("bottomright", c("sensitivity", "specificity"), col = c("blue", "red"), lty = c(1, 1))
+
+# Actually, if we look at distribution of pred:
+table(as.vector(pred))
+# The best threshold on this testing dataset is 0.50389
+
+
+
+
+# New predictions
+outLasso <- glmnet(lemma[c(trainTest, trainFlag),], 
+                   meta$age[c(trainTest, trainFlag)], 
+                   family="binomial", 
+                   alpha = best_alpha, lambda = best_lambda)
+pred <- 1 / (1 + exp(-1 * cbind(1,lemma[trainMiss,]) %*% coef(outLasso)))
+meta$age[trainMiss] <- as.numeric(pred >= cut)
+write.table(meta, "prediction_LASSO.txt", sep = " ")
+
+# saveRDS(meta, "age_prediction_LASSO.Rds")
+
+# Record params
+# result <- data.frame(alpha = alphaall, lambda = lambda_all, auc = auc_all)
+# write.table(result, "age_LASSO_paras.txt", sep = " ")
